@@ -1,15 +1,22 @@
 import { useEffect, useMemo, useReducer, useState } from 'react';
 import {
+  AbstractActionComponent,
   Action,
-  ActionComponent,
+  type ActionCallbacksConfig,
+  type ActionContext,
+  type ActionPostResponse,
+  type ActionSupportability,
+  ButtonActionComponent,
+  type ExtendedActionState,
+  FormActionComponent,
   getExtendedActionState,
   getExtendedInterstitialState,
   getExtendedWebsiteState,
+  isParameterSelectable,
+  isPatternAllowed,
   mergeActionStates,
-  type ActionCallbacksConfig,
-  type ActionContext,
-  type ExtendedActionState,
-  type Parameter,
+  MultiValueActionComponent,
+  SingleValueActionComponent,
 } from '../api';
 import { checkSecurity, type SecurityLevel } from '../shared';
 import { isInterstitial } from '../utils/interstitial-url.ts';
@@ -19,22 +26,29 @@ import {
 } from '../utils/type-guards.ts';
 import {
   ActionLayout,
-  DisclaimerType,
-  type ButtonProps,
   type Disclaimer,
+  DisclaimerType,
   type StylePreset,
 } from './ActionLayout';
 
-type ExecutionStatus = 'blocked' | 'idle' | 'executing' | 'success' | 'error';
+type ExecutionStatus =
+  | 'blocked'
+  | 'checking-supportability'
+  | 'idle'
+  | 'executing'
+  | 'success'
+  | 'error';
 
 interface ExecutionState {
   status: ExecutionStatus;
-  executingAction?: ActionComponent | null;
+  checkingSupportability?: boolean;
+  executingAction?: AbstractActionComponent | null;
   errorMessage?: string | null;
   successMessage?: string | null;
 }
 
 enum ExecutionType {
+  CHECK_SUPPORTABILITY = 'CHECK_SUPPORTABILITY',
   INITIATE = 'INITIATE',
   FINISH = 'FINISH',
   FAIL = 'FAIL',
@@ -46,8 +60,11 @@ enum ExecutionType {
 
 type ActionValue =
   | {
+      type: ExecutionType.CHECK_SUPPORTABILITY;
+    }
+  | {
       type: ExecutionType.INITIATE;
-      executingAction: ActionComponent;
+      executingAction: AbstractActionComponent;
       errorMessage?: string;
     }
   | {
@@ -77,6 +94,11 @@ const executionReducer = (
   action: ActionValue,
 ): ExecutionState => {
   switch (action.type) {
+    case ExecutionType.CHECK_SUPPORTABILITY:
+      return {
+        status: 'checking-supportability',
+        checkingSupportability: true,
+      };
     case ExecutionType.INITIATE:
       return { status: 'executing', executingAction: action.executingAction };
     case ExecutionType.FINISH:
@@ -120,6 +142,7 @@ const buttonVariantMap: Record<
   ExecutionStatus,
   'default' | 'error' | 'success'
 > = {
+  'checking-supportability': 'default',
   blocked: 'default',
   idle: 'default',
   executing: 'default',
@@ -128,6 +151,7 @@ const buttonVariantMap: Record<
 };
 
 const buttonLabelMap: Record<ExecutionStatus, string | null> = {
+  'checking-supportability': 'Loading',
   blocked: null,
   idle: null,
   executing: 'Executing',
@@ -193,8 +217,9 @@ const DEFAULT_SECURITY_LEVEL: SecurityLevel = 'only-trusted';
 type Source = 'websites' | 'interstitials' | 'actions';
 type NormalizedSecurityLevel = Record<Source, SecurityLevel>;
 
+// overall flow: check-supportability -> idle/block -> executing -> success/error or chain
 export const ActionContainer = ({
-  action,
+  action: initialAction,
   websiteUrl,
   websiteText,
   callbacks,
@@ -208,10 +233,10 @@ export const ActionContainer = ({
   callbacks?: Partial<ActionCallbacksConfig>;
   securityLevel?: SecurityLevel | NormalizedSecurityLevel;
   stylePreset?: StylePreset;
-
   // please do not use it yet, better api is coming..
   Experimental__ActionLayout?: typeof ActionLayout;
 }) => {
+  const [action, setAction] = useState(initialAction);
   const normalizedSecurityLevel: NormalizedSecurityLevel = useMemo(() => {
     if (typeof securityLevel === 'string') {
       return {
@@ -227,6 +252,11 @@ export const ActionContainer = ({
   const [actionState, setActionState] = useState(
     getOverallActionState(action, websiteUrl),
   );
+
+  const [supportability, setSupportability] = useState<ActionSupportability>({
+    isSupported: true,
+  });
+
   const overallState = useMemo(
     () =>
       mergeActionStates(
@@ -244,11 +274,21 @@ export const ActionContainer = ({
   );
 
   const [executionState, dispatch] = useReducer(executionReducer, {
-    status:
-      overallState !== 'malicious' && isPassingSecurityCheck
-        ? 'idle'
-        : 'blocked',
+    status: 'checking-supportability',
   });
+
+  // in case, where initialAction or websiteUrl changes, we need to reset the action state
+  useEffect(() => {
+    if (action === initialAction || action.isChained) {
+      return;
+    }
+
+    setAction(initialAction);
+    setActionState(getOverallActionState(initialAction, websiteUrl));
+    dispatch({ type: ExecutionType.CHECK_SUPPORTABILITY });
+    // we want to run this one when initialAction or websiteUrl changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialAction, websiteUrl]);
 
   useEffect(() => {
     callbacks?.onActionMount?.(
@@ -256,14 +296,75 @@ export const ActionContainer = ({
       websiteUrl ?? action.url,
       actionState.action,
     );
-    // we ignore changes to `actionState.action` explicitly, since we want this to run once
+    // we ignore changes to `actionState.action` or callbacks explicitly, since we want this to run once
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [callbacks, action, websiteUrl]);
+  }, [action, websiteUrl]);
+
+  useEffect(() => {
+    const liveDataConfig = action.liveData_experimental;
+    if (
+      !liveDataConfig ||
+      !liveDataConfig.enabled ||
+      executionState.status !== 'idle' ||
+      action.isChained
+    ) {
+      return;
+    }
+
+    let timeout: any; // NodeJS.Timeout
+    const fetcher = async () => {
+      try {
+        const newAction = await action.refresh();
+
+        // if after refresh user clicked started execution, we should not update the action
+        if (executionState.status === 'idle') {
+          setAction(newAction);
+        }
+      } catch (e) {
+        console.error(
+          `[@dialectlabs/blinks] Failed to fetch live data for action ${action.url}`,
+        );
+        // if fetch failed, we retry after the same delay
+        timeout = setTimeout(fetcher, liveDataConfig.delayMs);
+      }
+    };
+
+    // since either way we're rebuilding the whole action, we'll update and restart this effect
+    timeout = setTimeout(fetcher, liveDataConfig.delayMs);
+
+    return () => {
+      clearTimeout(timeout);
+    };
+  }, [action, executionState.status]);
+
+  useEffect(() => {
+    const checkSupportability = async (action: Action) => {
+      if (
+        action.isChained ||
+        executionState.status !== 'checking-supportability'
+      ) {
+        return;
+      }
+      try {
+        const supportability = await action.isSupported();
+        setSupportability(supportability);
+      } finally {
+        dispatch({
+          type:
+            overallState !== 'malicious' && isPassingSecurityCheck
+              ? ExecutionType.RESET
+              : ExecutionType.BLOCK,
+        });
+      }
+    };
+
+    checkSupportability(action);
+  }, [action, executionState.status, overallState, isPassingSecurityCheck]);
 
   const buttons = useMemo(
     () =>
       action?.actions
-        .filter((it) => !it.parameter)
+        .filter((it) => it instanceof ButtonActionComponent)
         .filter((it) =>
           executionState.executingAction
             ? executionState.executingAction === it
@@ -275,7 +376,11 @@ export const ActionContainer = ({
   const inputs = useMemo(
     () =>
       action?.actions
-        .filter((it) => it.parameters.length === 1)
+        .filter(
+          (it) =>
+            it instanceof SingleValueActionComponent ||
+            it instanceof MultiValueActionComponent,
+        )
         .filter((it) =>
           executionState.executingAction
             ? executionState.executingAction === it
@@ -287,7 +392,7 @@ export const ActionContainer = ({
   const form = useMemo(() => {
     const [formComponent] =
       action?.actions
-        .filter((it) => it.parameters.length > 1)
+        .filter((it) => it instanceof FormActionComponent)
         .filter((it) =>
           executionState.executingAction
             ? executionState.executingAction === it
@@ -298,13 +403,28 @@ export const ActionContainer = ({
   }, [action, executionState.executingAction]);
 
   const execute = async (
-    component: ActionComponent,
-    params?: Record<string, string>,
+    component: AbstractActionComponent,
+    params?: Record<string, string | string[]>,
   ) => {
-    if (component.parameters && params) {
-      Object.entries(params).forEach(([name, value]) =>
-        component.setValue(value, name),
-      );
+    if (params) {
+      if (component instanceof FormActionComponent) {
+        Object.entries(params).forEach(([name, value]) =>
+          component.setValue(value, name),
+        );
+      }
+
+      if (component instanceof MultiValueActionComponent) {
+        component.setValue(params[component.parameter.name]);
+      }
+
+      if (component instanceof SingleValueActionComponent) {
+        const incomingValues = params[component.parameter.name];
+        const value =
+          typeof incomingValues === 'string'
+            ? incomingValues
+            : incomingValues[0];
+        component.setValue(value);
+      }
     }
 
     const newActionState = getOverallActionState(action, websiteUrl);
@@ -344,10 +464,12 @@ export const ActionContainer = ({
         .post(account)
         .catch((e: Error) => ({ error: e.message }));
 
-      if (isPostRequestError(tx)) {
+      if (!(tx as ActionPostResponse).transaction || isPostRequestError(tx)) {
         dispatch({
           type: ExecutionType.SOFT_RESET,
-          errorMessage: tx.error,
+          errorMessage: isPostRequestError(tx)
+            ? tx.error
+            : 'Transaction data missing',
         });
         return;
       }
@@ -361,50 +483,100 @@ export const ActionContainer = ({
         dispatch({ type: ExecutionType.RESET });
       } else {
         await action.adapter.confirmTransaction(signResult.signature, context);
-        dispatch({
-          type: ExecutionType.FINISH,
-          successMessage: tx.message,
+
+        if (!tx.links?.next) {
+          dispatch({
+            type: ExecutionType.FINISH,
+            successMessage: tx.message,
+          });
+          return;
+        }
+
+        // chain
+        const nextAction = await action.chain(tx.links.next, {
+          signature: signResult.signature,
+          account: account,
         });
+
+        if (!nextAction) {
+          dispatch({
+            type: ExecutionType.FINISH,
+            successMessage: tx.message,
+          });
+          return;
+        }
+
+        setAction(nextAction);
+        dispatch({ type: ExecutionType.RESET });
       }
     } catch (e) {
       dispatch({
-        type: ExecutionType.FAIL,
-        errorMessage: (e as Error).message ?? 'Unknown error',
+        type: ExecutionType.SOFT_RESET,
+        errorMessage: (e as Error).message ?? 'Unknown error, please try again',
       });
     }
   };
 
-  const asButtonProps = (it: ActionComponent): ButtonProps => ({
-    text: buttonLabelMap[executionState.status] ?? it.label,
-    loading:
-      executionState.status === 'executing' &&
-      it === executionState.executingAction,
-    disabled: action.disabled || executionState.status !== 'idle',
-    variant: buttonVariantMap[executionState.status],
-    onClick: (params?: Record<string, string>) => execute(it, params),
-  });
-
-  const asInputProps = (it: ActionComponent, parameter?: Parameter) => {
-    const placeholder = !parameter ? it.parameter!.label : parameter.label;
-    const name = !parameter ? it.parameter!.name : parameter.name;
-    const required = !parameter ? it.parameter!.required : parameter.required;
-
+  const asButtonProps = (it: ButtonActionComponent) => {
     return {
-      // since we already filter this, we can safely assume that parameter is not null
-      placeholder,
-      disabled: action.disabled || executionState.status !== 'idle',
-      name,
-      required,
-      button: !parameter ? asButtonProps(it) : undefined,
+      text: buttonLabelMap[executionState.status] ?? it.label,
+      loading:
+        executionState.status === 'executing' &&
+        it === executionState.executingAction,
+      disabled:
+        action.disabled ||
+        action.type === 'completed' ||
+        executionState.status !== 'idle',
+      variant:
+        buttonVariantMap[
+          action.type === 'completed' ? 'success' : executionState.status
+        ],
+      onClick: (params?: Record<string, string | string[]>) =>
+        execute(it.parentComponent ?? it, params),
     };
   };
 
-  const asFormProps = (it: ActionComponent) => {
+  const asInputProps = (
+    it: SingleValueActionComponent | MultiValueActionComponent,
+    { placement }: { placement: 'form' | 'standalone' } = {
+      placement: 'standalone',
+    },
+  ) => {
     return {
-      button: asButtonProps(it),
-      inputs: it.parameters
-        .toSpliced(SOFT_LIMIT_FORM_INPUTS)
-        .map((parameter) => asInputProps(it, parameter)),
+      type: it.parameter.type ?? 'text',
+      placeholder: it.parameter.label,
+      disabled:
+        action.disabled ||
+        action.type === 'completed' ||
+        executionState.status !== 'idle',
+      name: it.parameter.name,
+      required: it.parameter.required,
+      min: it.parameter.min,
+      max: it.parameter.max,
+      pattern:
+        it instanceof SingleValueActionComponent &&
+        isPatternAllowed(it.parameter)
+          ? it.parameter.pattern
+          : undefined,
+      options: isParameterSelectable(it.parameter)
+        ? it.parameter.options
+        : undefined,
+      description: it.parameter.patternDescription,
+      button:
+        placement === 'standalone'
+          ? asButtonProps(it.toButtonActionComponent())
+          : undefined,
+    };
+  };
+
+  const asFormProps = (it: FormActionComponent) => {
+    return {
+      button: asButtonProps(it.toButtonActionComponent()),
+      inputs: it.parameters.toSpliced(SOFT_LIMIT_FORM_INPUTS).map((parameter) =>
+        asInputProps(it.toInputActionComponent(parameter.name), {
+          placement: 'form',
+        }),
+      ),
     };
   };
 
@@ -413,7 +585,9 @@ export const ActionContainer = ({
       return {
         type: DisclaimerType.BLOCKED,
         ignorable: isPassingSecurityCheck,
-        hidden: executionState.status !== 'blocked',
+        hidden:
+          executionState.status !== 'blocked' &&
+          executionState.status !== 'checking-supportability',
         onSkip: () => dispatch({ type: ExecutionType.UNBLOCK }),
       };
     }
@@ -443,10 +617,11 @@ export const ActionContainer = ({
           : null
       }
       success={executionState.successMessage}
-      buttons={buttons.map(asButtonProps)}
+      buttons={buttons.map((button) => asButtonProps(button))}
       inputs={inputs.map((input) => asInputProps(input))}
       form={form ? asFormProps(form) : undefined}
       disclaimer={disclaimer}
+      supportability={supportability}
     />
   );
 };

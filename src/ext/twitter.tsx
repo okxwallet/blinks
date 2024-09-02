@@ -1,19 +1,21 @@
 import { createRoot } from 'react-dom/client';
 import {
   Action,
+  type ActionAdapter,
+  type ActionCallbacksConfig,
   ActionsRegistry,
+  type ActionSupportStrategy,
+  defaultActionSupportStrategy,
   getExtendedActionState,
   getExtendedInterstitialState,
   getExtendedWebsiteState,
-  type ActionAdapter,
-  type ActionCallbacksConfig,
 } from '../api';
 import { checkSecurity, type SecurityLevel } from '../shared';
 import { ActionContainer, type StylePreset } from '../ui';
 import { noop } from '../utils/constants';
 import { isInterstitial } from '../utils/interstitial-url.ts';
 import { proxify } from '../utils/proxify.ts';
-import { ActionsURLMapper, type ActionsJsonConfig } from '../utils/url-mapper';
+import { type ActionsJsonConfig, ActionsURLMapper } from '../utils/url-mapper';
 
 type ObserverSecurityLevel = SecurityLevel;
 
@@ -22,6 +24,7 @@ export interface ObserverOptions {
   securityLevel:
     | ObserverSecurityLevel
     | Record<'websites' | 'interstitials' | 'actions', ObserverSecurityLevel>;
+  supportStrategy: ActionSupportStrategy;
 }
 
 interface NormalizedObserverOptions {
@@ -29,10 +32,12 @@ interface NormalizedObserverOptions {
     'websites' | 'interstitials' | 'actions',
     ObserverSecurityLevel
   >;
+  supportStrategy: ActionSupportStrategy;
 }
 
 const DEFAULT_OPTIONS: ObserverOptions = {
   securityLevel: 'only-trusted',
+  supportStrategy: defaultActionSupportStrategy,
 };
 
 const normalizeOptions = (
@@ -82,6 +87,7 @@ export function setupTwitterObserver(
       // it's fast to iterate like this
       for (let i = 0; i < mutations.length; i++) {
         const mutation = mutations[i];
+
         for (let j = 0; j < mutation.addedNodes.length; j++) {
           const node = mutation.addedNodes[j];
           if (node.nodeType !== Node.ELEMENT_NODE) {
@@ -100,6 +106,7 @@ export function setupTwitterObserver(
     observer.observe(twitterReactRoot, { childList: true, subtree: true });
   });
 }
+
 async function handleNewNode(
   node: Element,
   config: ActionAdapter,
@@ -180,32 +187,39 @@ async function handleNewNode(
     return;
   }
 
-  const action = await Action.fetch(actionApiUrl, config).catch(noop);
+  const action = await Action.fetch(
+    actionApiUrl,
+    config,
+    options.supportStrategy,
+  ).catch(noop);
 
   if (!action) {
     return;
   }
 
-  if (config.isSupported) {
-    const supported = await config.isSupported({
-      originalUrl: actionUrl.toString(),
-      action,
-      actionType: state,
-    });
-    if (!supported) {
-      return;
-    }
-  }
+  const { container: actionContainer, reactRoot } = createAction({
+    originalUrl: actionUrl,
+    action,
+    callbacks,
+    options,
+    isInterstitial: interstitialData.isInterstitial,
+  });
 
-  addMargin(container).replaceChildren(
-    createAction({
-      originalUrl: actionUrl,
-      action,
-      callbacks,
-      options,
-      isInterstitial: interstitialData.isInterstitial,
-    }),
-  );
+  addStyles(container).replaceChildren(actionContainer);
+
+  new MutationObserver((mutations, observer) => {
+    for (const mutation of mutations) {
+      for (const removedNode of Array.from(mutation.removedNodes)) {
+        if (
+          removedNode === actionContainer ||
+          !document.body.contains(actionContainer)
+        ) {
+          reactRoot.unmount();
+          observer.disconnect();
+        }
+      }
+    }
+  }).observe(document.body, { childList: true, subtree: true });
 }
 
 function createAction({
@@ -226,17 +240,19 @@ function createAction({
   const actionRoot = createRoot(container);
 
   actionRoot.render(
-    <ActionContainer
-      stylePreset={resolveXStylePreset()}
-      action={action}
-      websiteUrl={originalUrl.toString()}
-      websiteText={originalUrl.hostname}
-      callbacks={callbacks}
-      securityLevel={options.securityLevel}
-    />,
+    <div onClick={(e) => e.stopPropagation()}>
+      <ActionContainer
+        stylePreset={resolveXStylePreset()}
+        action={action}
+        websiteUrl={originalUrl.toString()}
+        websiteText={originalUrl.hostname}
+        callbacks={callbacks}
+        securityLevel={options.securityLevel}
+      />
+    </div>,
   );
 
-  return container;
+  return { container, reactRoot: actionRoot };
 }
 
 const resolveXStylePreset = (): StylePreset => {
@@ -289,6 +305,7 @@ function findLinkPreview(element: Element) {
 
   return anchor ? { anchor, card } : null;
 }
+
 function findLastLinkInText(element: Element) {
   const tweetText = findElementByTestId(element, 'tweetText');
   if (!tweetText) {
@@ -316,11 +333,13 @@ function getContainerForLink(tweetText: Element) {
   return root;
 }
 
-function addMargin(element: HTMLElement) {
+function addStyles(element: HTMLElement) {
   if (element && element.classList.contains('dialect-wrapper')) {
     element.style.marginTop = '12px';
     if (element.classList.contains('dialect-dm')) {
       element.style.marginBottom = '8px';
+      element.style.width = '100%';
+      element.style.minWidth = '350px';
     }
   }
   return element;

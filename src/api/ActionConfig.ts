@@ -1,19 +1,37 @@
 import { Connection } from '@solana/web3.js';
-import { ActionComponent, type Action } from './Action.ts';
+import { type Action } from './Action';
+import { AbstractActionComponent } from './Action/action-components';
+import { DEFAULT_SUPPORTED_BLOCKCHAIN_IDS } from './Action/action-supportability.ts';
 
 export interface ActionContext {
   originalUrl: string;
   action: Action;
   actionType: 'trusted' | 'malicious' | 'unknown';
-  triggeredLinkedAction: ActionComponent;
+  triggeredLinkedAction: AbstractActionComponent;
 }
 
 export interface IncomingActionConfig {
   rpcUrl: string;
-  adapter: Pick<ActionAdapter, 'connect' | 'signTransaction'>;
+  adapter: Pick<ActionAdapter, 'connect' | 'signTransaction'> &
+    Partial<Pick<ActionAdapter, 'metadata'>>;
+}
+
+/**
+ * Metadata for an action adapter.
+ *
+ * @property supportedBlockchainIds List of CAIP-2 blockchain IDs the adapter supports.
+ *
+ * @see {BlockchainIds}
+ */
+export interface ActionAdapterMetadata {
+  /**
+   * List of CAIP-2 blockchain IDs the adapter supports.
+   */
+  supportedBlockchainIds: string[];
 }
 
 export interface ActionAdapter {
+  metadata: ActionAdapterMetadata;
   connect: (context: ActionContext) => Promise<string | null>;
   signTransaction: (
     tx: string,
@@ -23,13 +41,13 @@ export interface ActionAdapter {
     signature: string,
     context: ActionContext,
   ) => Promise<void>;
-  isSupported?: (
-    context: Omit<ActionContext, 'triggeredLinkedAction'>,
-  ) => Promise<boolean>;
 }
 
 export class ActionConfig implements ActionAdapter {
   private static readonly CONFIRM_TIMEOUT_MS = 60000 * 1.2; // 20% extra time
+  private static readonly DEFAULT_METADATA: ActionAdapterMetadata = {
+    supportedBlockchainIds: DEFAULT_SUPPORTED_BLOCKCHAIN_IDS,
+  };
   private connection: Connection;
 
   constructor(
@@ -46,12 +64,8 @@ export class ActionConfig implements ActionAdapter {
         : rpcUrlOrConnection;
   }
 
-  async connect(context: ActionContext) {
-    try {
-      return await this.adapter.connect(context);
-    } catch {
-      return null;
-    }
+  get metadata() {
+    return this.adapter.metadata ?? ActionConfig.DEFAULT_METADATA;
   }
 
   signTransaction(tx: string, context: ActionContext) {
@@ -64,7 +78,7 @@ export class ActionConfig implements ActionAdapter {
 
       const confirm = async () => {
         if (Date.now() - start >= ActionConfig.CONFIRM_TIMEOUT_MS) {
-          rej(new Error('Unable to confirm transaction'));
+          rej(new Error('Unable to confirm transaction: timeout reached'));
           return;
         }
 
@@ -73,7 +87,11 @@ export class ActionConfig implements ActionAdapter {
 
           // if error present, transaction failed
           if (status.value?.err) {
-            rej(new Error('Transaction execution failed'));
+            rej(
+              new Error(
+                `Transaction execution failed, check wallet for details`,
+              ),
+            );
             return;
           }
 
@@ -94,5 +112,13 @@ export class ActionConfig implements ActionAdapter {
 
       confirm();
     });
+  }
+
+  async connect(context: ActionContext) {
+    try {
+      return await this.adapter.connect(context);
+    } catch {
+      return null;
+    }
   }
 }
